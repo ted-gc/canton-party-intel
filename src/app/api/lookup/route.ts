@@ -3,22 +3,16 @@ import { NextRequest, NextResponse } from 'next/server';
 const CANTON_NODES_API = 'https://api.cantonnodes.com';
 const DOMAIN_ID = 'global-domain::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc';
 
-interface ExplorerResult {
-  name: string;
-  status: 'loading' | 'success' | 'error' | 'not_found';
-  data?: Record<string, unknown>;
-  error?: string;
-  url?: string;
-}
-
 interface ValidatorLicense {
   payload: {
     validator: string;
     sponsor: string;
     lastActiveAt: string;
+    dso: string;
     metadata?: {
       version?: string;
       contactPoint?: string;
+      lastUpdatedAt?: string;
     };
     faucetState?: {
       firstReceivedFor?: { number: string };
@@ -26,133 +20,241 @@ interface ValidatorLicense {
       numCouponsMissed?: string;
     };
   };
+  contract_id: string;
+  created_at: string;
+}
+
+interface ExplorerResult {
+  name: string;
+  status: 'success' | 'error' | 'not_found';
+  url: string;
+}
+
+// Cache validators for 5 minutes
+let validatorCache: {
+  data: ValidatorLicense[];
+  timestamp: number;
+} | null = null;
+
+async function getValidators(): Promise<ValidatorLicense[]> {
+  const now = Date.now();
+  if (validatorCache && now - validatorCache.timestamp < 5 * 60 * 1000) {
+    return validatorCache.data;
+  }
+
+  let allValidators: ValidatorLicense[] = [];
+  let nextPageToken: string | undefined;
+
+  do {
+    const url = nextPageToken
+      ? `${CANTON_NODES_API}/v0/admin/validator/licenses?page_token=${nextPageToken}`
+      : `${CANTON_NODES_API}/v0/admin/validator/licenses`;
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`API returned ${res.status}`);
+
+    const data = await res.json();
+    allValidators = allValidators.concat(data.validator_licenses || []);
+    nextPageToken = data.next_page_token;
+  } while (nextPageToken);
+
+  validatorCache = { data: allValidators, timestamp: now };
+  return allValidators;
 }
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const partyId = searchParams.get('partyId');
+  const query = searchParams.get('partyId') || searchParams.get('q') || '';
 
-  if (!partyId) {
-    return NextResponse.json({ error: 'Party ID is required' }, { status: 400 });
+  if (!query) {
+    return NextResponse.json({ error: 'Party ID or search query is required' }, { status: 400 });
   }
 
-  const results: ExplorerResult[] = [];
-  let participantId: string | undefined;
-  let isValidator = false;
-  let validatorInfo: Record<string, unknown> | undefined;
-
-  // Parse party ID
-  const parts = partyId.split('::');
-  const namespace = parts.length === 2 ? parts[0] : 'unknown';
-  const fingerprint = parts.length === 2 ? parts[1] : partyId;
-
-  // Check if it's the DSO party
-  const isDSO = namespace === 'DSO';
-
   try {
-    // 1. Try to get participant ID from CantonNodes
-    try {
-      const participantRes = await fetch(
-        `${CANTON_NODES_API}/v0/domains/${DOMAIN_ID}/parties/${encodeURIComponent(partyId)}/participant-id`,
-        { next: { revalidate: 60 } }
-      );
-      
-      if (participantRes.ok) {
-        const data = await participantRes.json();
-        participantId = data.participant_id;
-        results.push({
-          name: 'CantonNodes',
-          status: 'success',
-          data: { participantId },
-          url: CANTON_NODES_API
-        });
-      } else {
-        results.push({
-          name: 'CantonNodes',
-          status: 'not_found',
-          url: CANTON_NODES_API
-        });
+    const validators = await getValidators();
+    const queryLower = query.toLowerCase();
+
+    // Try exact match first
+    let exactMatch = validators.find(v => 
+      v.payload?.validator === query || v.payload?.sponsor === query
+    );
+
+    // Search by partial name or fingerprint
+    let matches: ValidatorLicense[] = [];
+    if (!exactMatch) {
+      matches = validators.filter(v => {
+        const validator = v.payload?.validator?.toLowerCase() || '';
+        const sponsor = v.payload?.sponsor?.toLowerCase() || '';
+        return validator.includes(queryLower) || sponsor.includes(queryLower);
+      });
+
+      // If single match, treat as exact
+      if (matches.length === 1) {
+        exactMatch = matches[0];
+        matches = [];
       }
-    } catch (err) {
-      results.push({
-        name: 'CantonNodes',
-        status: 'error',
-        error: 'Failed to query',
-        url: CANTON_NODES_API
+    }
+
+    // If multiple matches, return search results
+    if (matches.length > 1) {
+      const results = matches.slice(0, 50).map(v => ({
+        validator: v.payload?.validator,
+        validatorName: v.payload?.validator?.split('::')[0],
+        sponsor: v.payload?.sponsor,
+        sponsorName: v.payload?.sponsor?.split('::')[0],
+        lastActiveAt: v.payload?.lastActiveAt,
+        version: v.payload?.metadata?.version
+      }));
+
+      return NextResponse.json({
+        type: 'search_results',
+        query,
+        count: matches.length,
+        results
       });
     }
 
-    // 2. Check if party is a validator
-    try {
-      const validatorsRes = await fetch(
-        `${CANTON_NODES_API}/v0/admin/validator/licenses?limit=500`,
-        { next: { revalidate: 300 } }
-      );
-      
-      if (validatorsRes.ok) {
-        const data = await validatorsRes.json();
-        const validator = data.validator_licenses?.find(
-          (v: ValidatorLicense) => v.payload?.validator === partyId
+    // No matches found
+    if (!exactMatch) {
+      // Try participant ID lookup as fallback
+      let participantId: string | undefined;
+      try {
+        const participantRes = await fetch(
+          `${CANTON_NODES_API}/v0/domains/${DOMAIN_ID}/parties/${encodeURIComponent(query)}/participant-id`
         );
-        
-        if (validator) {
-          isValidator = true;
-          validatorInfo = {
-            sponsor: validator.payload.sponsor,
-            lastActiveAt: validator.payload.lastActiveAt,
-            metadata: validator.payload.metadata,
-            faucetState: validator.payload.faucetState
-          };
+        if (participantRes.ok) {
+          const data = await participantRes.json();
+          participantId = data.participant_id;
         }
+      } catch {
+        // Ignore
       }
-    } catch (err) {
-      // Non-critical, continue
+
+      if (participantId) {
+        return NextResponse.json({
+          type: 'party',
+          partyId: query,
+          namespace: query.split('::')[0] || 'unknown',
+          fingerprint: query.split('::')[1] || query,
+          participantId,
+          isValidator: false,
+          isSponsor: false,
+          explorers: generateExplorerLinks(query)
+        });
+      }
+
+      return NextResponse.json({
+        type: 'not_found',
+        query,
+        message: 'No validator or party found matching this query'
+      });
     }
 
-    // 3. Generate explorer links
-    const explorerLinks: ExplorerResult[] = [
-      {
-        name: 'CCView.io',
-        status: 'success',
-        url: `https://ccview.io/governance/${encodeURIComponent(partyId)}/`
-      },
-      {
-        name: 'CantonScan',
-        status: 'success', 
-        url: `https://www.cantonscan.com/`
-      },
-      {
-        name: '5N Lighthouse',
-        status: 'success',
-        url: `https://lighthouse.cantonloop.com/`
-      },
-      {
-        name: 'CC Explorer',
-        status: 'success',
-        url: `https://ccexplorer.io/`
-      },
-      {
-        name: 'The Tie',
-        status: 'success',
-        url: `https://canton.thetie.io/`
+    // Build detailed response for exact match
+    const partyId = exactMatch.payload?.validator || query;
+    const parts = partyId.split('::');
+    const namespace = parts[0] || 'unknown';
+    const fingerprint = parts[1] || partyId;
+
+    // Check if this party is also a sponsor
+    const sponsoredValidators = validators.filter(v => v.payload?.sponsor === partyId);
+    const isSponsor = sponsoredValidators.length > 0;
+
+    // Get sponsor info
+    const sponsorId = exactMatch.payload?.sponsor;
+    const allSponsoredBySameSponsor = validators.filter(v => v.payload?.sponsor === sponsorId);
+
+    // Try to get participant ID
+    let participantId: string | undefined;
+    try {
+      const participantRes = await fetch(
+        `${CANTON_NODES_API}/v0/domains/${DOMAIN_ID}/parties/${encodeURIComponent(partyId)}/participant-id`
+      );
+      if (participantRes.ok) {
+        const data = await participantRes.json();
+        participantId = data.participant_id;
       }
-    ];
+    } catch {
+      // Ignore
+    }
 
     return NextResponse.json({
+      type: 'party',
       partyId,
       namespace,
       fingerprint,
-      isDSO,
       participantId,
-      isValidator,
-      validatorInfo,
-      explorers: [...results, ...explorerLinks]
+      isValidator: true,
+      validatorInfo: {
+        sponsor: exactMatch.payload?.sponsor,
+        sponsorName: exactMatch.payload?.sponsor?.split('::')[0],
+        lastActiveAt: exactMatch.payload?.lastActiveAt,
+        metadata: exactMatch.payload?.metadata,
+        faucetState: exactMatch.payload?.faucetState,
+        contractId: exactMatch.contract_id,
+        createdAt: exactMatch.created_at
+      },
+      isSponsor,
+      sponsorInfo: isSponsor ? {
+        validatorCount: sponsoredValidators.length,
+        validators: sponsoredValidators.slice(0, 20).map(v => ({
+          validator: v.payload?.validator,
+          validatorName: v.payload?.validator?.split('::')[0],
+          lastActiveAt: v.payload?.lastActiveAt,
+          version: v.payload?.metadata?.version
+        }))
+      } : undefined,
+      siblingValidators: {
+        sponsor: sponsorId,
+        sponsorName: sponsorId?.split('::')[0],
+        totalCount: allSponsoredBySameSponsor.length,
+        others: allSponsoredBySameSponsor
+          .filter(v => v.payload?.validator !== partyId)
+          .slice(0, 10)
+          .map(v => ({
+            validator: v.payload?.validator,
+            validatorName: v.payload?.validator?.split('::')[0]
+          }))
+      },
+      explorers: generateExplorerLinks(partyId)
     });
 
   } catch (error) {
+    console.error('Lookup error:', error);
     return NextResponse.json(
       { error: 'Failed to lookup party information' },
       { status: 500 }
     );
   }
+}
+
+function generateExplorerLinks(partyId: string): ExplorerResult[] {
+  const encoded = encodeURIComponent(partyId);
+  return [
+    {
+      name: 'CCView.io',
+      status: 'success',
+      url: `https://ccview.io/governance/${encoded}/`
+    },
+    {
+      name: 'CantonScan',
+      status: 'success',
+      url: `https://www.cantonscan.com/party/${encoded}`
+    },
+    {
+      name: '5N Lighthouse',
+      status: 'success',
+      url: `https://lighthouse.cantonloop.com/party/${encoded}`
+    },
+    {
+      name: 'CC Explorer',
+      status: 'success',
+      url: `https://ccexplorer.io/party/${encoded}`
+    },
+    {
+      name: 'The Tie',
+      status: 'success',
+      url: `https://canton.thetie.io/party/${encoded}`
+    }
+  ];
 }
