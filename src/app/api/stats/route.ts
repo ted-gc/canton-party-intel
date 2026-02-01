@@ -32,27 +32,21 @@ interface VersionStats {
   count: number;
 }
 
+export const maxDuration = 30; // Allow up to 30s for serverless
+
 export async function GET() {
   try {
-    // Fetch all validators (paginated)
-    let allValidators: ValidatorLicense[] = [];
-    let nextPageToken: string | undefined;
+    // Fetch all validators (single request - API returns all at once)
+    const res = await fetch(`${CANTON_NODES_API}/v0/admin/validator/licenses`, {
+      headers: { 'Accept': 'application/json' },
+    });
     
-    do {
-      const url = nextPageToken 
-        ? `${CANTON_NODES_API}/v0/admin/validator/licenses?page_token=${nextPageToken}`
-        : `${CANTON_NODES_API}/v0/admin/validator/licenses`;
-      
-      const res = await fetch(url, { next: { revalidate: 300 } });
-      
-      if (!res.ok) {
-        throw new Error(`API returned ${res.status}`);
-      }
-      
-      const data = await res.json();
-      allValidators = allValidators.concat(data.validator_licenses || []);
-      nextPageToken = data.next_page_token;
-    } while (nextPageToken);
+    if (!res.ok) {
+      throw new Error(`API returned ${res.status}`);
+    }
+    
+    const data = await res.json();
+    const allValidators: ValidatorLicense[] = data.validator_licenses || [];
 
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();

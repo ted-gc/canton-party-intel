@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+export const maxDuration = 30; // Allow up to 30s for serverless
+
 const CANTON_NODES_API = 'https://api.cantonnodes.com';
 const DOMAIN_ID = 'global-domain::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc';
 
@@ -42,21 +44,14 @@ async function getValidators(): Promise<ValidatorLicense[]> {
     return validatorCache.data;
   }
 
-  let allValidators: ValidatorLicense[] = [];
-  let nextPageToken: string | undefined;
+  const res = await fetch(`${CANTON_NODES_API}/v0/admin/validator/licenses`, {
+    headers: { 'Accept': 'application/json' },
+  });
+  
+  if (!res.ok) throw new Error(`API returned ${res.status}`);
 
-  do {
-    const url = nextPageToken
-      ? `${CANTON_NODES_API}/v0/admin/validator/licenses?page_token=${nextPageToken}`
-      : `${CANTON_NODES_API}/v0/admin/validator/licenses`;
-
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`API returned ${res.status}`);
-
-    const data = await res.json();
-    allValidators = allValidators.concat(data.validator_licenses || []);
-    nextPageToken = data.next_page_token;
-  } while (nextPageToken);
+  const data = await res.json();
+  const allValidators: ValidatorLicense[] = data.validator_licenses || [];
 
   validatorCache = { data: allValidators, timestamp: now };
   return allValidators;
