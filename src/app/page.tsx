@@ -195,7 +195,7 @@ export default function Home() {
                         new Date(String(partyInfo.validatorInfo.lastActiveAt)).toLocaleString() : 'Unknown'}
                     </span>
                   </div>
-                  {partyInfo.validatorInfo.metadata && (
+                  {partyInfo.validatorInfo.metadata ? (
                     <>
                       <div>
                         <span className="text-gray-500">Version:</span>
@@ -206,7 +206,7 @@ export default function Home() {
                         <span className="ml-2">{String((partyInfo.validatorInfo.metadata as Record<string, unknown>).contactPoint || 'N/A')}</span>
                       </div>
                     </>
-                  )}
+                  ) : null}
                 </div>
               </div>
             )}
